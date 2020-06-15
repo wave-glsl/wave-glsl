@@ -18,7 +18,7 @@ const AMP_FACTOR = 1.05;
 const FREQ_FACTOR = 2 ** (1 / 12); // en.wikipedia.org/wiki/Piano_key_frequencies
 const UPDATE_STEPS = +USP.get('s') || 4;
 const DAMPING = +USP.get('g') || 1;
-const MODULATION = 1e-3;
+const MODULATION = +USP.get('m') || 1e-3;
 const cos = Math.cos;
 const sin = Math.sin;
 const PI = Math.PI;
@@ -62,7 +62,7 @@ async function main() {
   }
 
   setKeyboardHandlers();
-  // setMouseHandlers();
+  setMouseHandlers();
 
   wave.setInitialWave(NOISE_AMP, NOISE_FREQ, NOISE_RADIUS);
   wave.setInitialEdge(EDGE_RADIUS, EDGE_SHARPNESS);
@@ -175,8 +175,9 @@ function setMouseHandlers() {
 }
 
 function startStop() {
-  if (running = !running)
-    animateWave();
+  running = !running;
+  console.log(running ? 'started' : 'stopped');
+  running && animateWave();
 }
 
 function printStats() {
