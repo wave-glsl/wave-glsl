@@ -1,22 +1,23 @@
 // http://localhost:2281/web/?n=512&s=64&t=8&a=3000
 const USP = new URLSearchParams(location.search);
 const USE_GPU = USP.get('gpu') != 0;
+const ITERATIONS = USP.get('i') === null ? 7 : +USP.get('i');
 const INITIAL_GRID_SIZE = +USP.get('n') || 128;
 const INITIAL_AMP = +USP.get('a') || 5;
-const INITIAL_FREQ = +USP.get('f') || 27.5;
+const INITIAL_FREQ = +USP.get('f') || 20;
 const MIN_GRID_SIZE = 64;
 const MAX_GRID_SIZE = 2048;
 const RESIZE_FACTOR = 2;
-const DISH_SIZE = 1;
-const WAVE_SPEED = 1;
-const NOISE_AMP = 0.1;
-const NOISE_FREQ = 0;
-const NOISE_RADIUS = 0.25;
+const WAVE_SPEED = +USP.get('c') || 1;
+const NOISE_AMP = 1e-3;
+const NOISE_FREQ = +USP.get('nf') || 0;
+const NOISE_RADIUS = 0.5;
 const EDGE_RADIUS = 0.95;
 const EDGE_SHARPNESS = +USP.get('e') || 1 / INITIAL_GRID_SIZE;
+const DISH_SIZE = 1 / EDGE_RADIUS;
 const AMP_FACTOR = 1.05;
 const FREQ_FACTOR = 2 ** (1 / 12); // en.wikipedia.org/wiki/Piano_key_frequencies
-const UPDATE_STEPS = +USP.get('s') || 4;
+const UPDATE_STEPS = +USP.get('s') || 32;
 const DAMPING = +USP.get('g') || 1;
 const MODULATION = +USP.get('m') || 1e-3;
 const cos = Math.cos;
@@ -24,16 +25,20 @@ const sin = Math.sin;
 const PI = Math.PI;
 const INPUT_WAVE_0 = t => -DAMPING + drivingAmp;
 const INPUT_WAVE_1 = t => -DAMPING + drivingAmp * cos(drivingFreq * t);
-const INPUT_WAVE_2 = t => -DAMPING + drivingAmp * cos(drivingFreq * (1 + MODULATION * sin(t * 2 * PI)) * t);
-const INPUT_WAVE_3 = t => -DAMPING + drivingAmp * (1 + MODULATION * sin(t * 2 * PI)) * cos(drivingFreq * t);
-const INPUT_WAVE = INPUT_WAVE_1;
+const INPUT_WAVE_2 = t => -DAMPING + drivingAmp * cos(drivingFreq * (1 + MODULATION * sin(t / 15)) * t);
+const INPUT_WAVE_3 = t => -DAMPING + drivingAmp * (1 + MODULATION * sin(t / 15)) * cos(drivingFreq * t);
+const INPUT_WAVE = INPUT_WAVE_2;
 const WAVE_FILENAME = 'wave_surface.obj'
 const RING_FILENAME = 'led_ring.obj';
-const MAX_CANVAS_SIZE = 512;
-const DT_DIVIDER = Math.max(1, +USP.get('t') || 0);
+const MAX_CANVAS_SIZE = 1024;
+const DT_DIVIDER = Math.max(1, +USP.get('dt') || 0);
+const WAVE_AMP_MAX = 1e-1;
+const WAVE_AMP_MIN = 1e-10;
+const WAVE_AMP_NORMALIZED = 1e-4;
+const ANIMATE_WAVE_MESSAGE = 'wave-update';
 
 const UPDATE_INTERVAL = 0;
-const RENDER_INTERVAL = +USP.get('rt') || 0; // ms, 0 for continuous rendering
+const RENDER_INTERVAL = +USP.get('r') || 0; // ms, 0 for continuous rendering
 const STATS_INTERVAL = 1000; // ms, 0 to disable
 const STATS_ID = '#stats';
 
@@ -45,7 +50,8 @@ let running = false;
 let drawIsolines = false;
 let numSteps = 0;
 let computeTime = 0;
-let renderTime = 0;
+let numRenderedFrames = 0;
+let prevWaveTime = 0;
 let prevRenderTime = -Infinity;
 let prevStatsTime = -Infinity;
 let pstats = document.querySelector(STATS_ID);
@@ -63,10 +69,20 @@ async function main() {
 
   setKeyboardHandlers();
   setMouseHandlers();
+  setUpdateMessageHandler();
 
   wave.setInitialWave(NOISE_AMP, NOISE_FREQ, NOISE_RADIUS);
   wave.setInitialEdge(EDGE_RADIUS, EDGE_SHARPNESS);
   renderWave();
+}
+
+function setUpdateMessageHandler() {
+  if (RENDER_INTERVAL > 0) {
+    window.onmessage = e => {
+      if (e.data === ANIMATE_WAVE_MESSAGE)
+        animateWave();
+    };
+  }
 }
 
 function setKeyboardHandlers() {
@@ -83,9 +99,16 @@ function setKeyboardHandlers() {
   console.log('b: decrease speed');
   console.log('n: increase speed');
   console.log('w: make a wavefront obj file');
+  console.log('a: normalize wave amplitude 3*sigma -> 1.0');
 
   document.onkeypress = e => {
     switch (e.key) {
+      case 'a':
+        console.log('Normalizing wave amplitude');
+        wave.normalizeAmplitude();
+        renderWave();
+        printStats();
+        break;
       case 'w':
         console.log('generating a wave surface obj file');
         downloadFile(
@@ -140,8 +163,8 @@ function setKeyboardHandlers() {
             spectrogram.recordedSound.length *
             spectrogram.frameSize | 0, 'sec');
           wave.inputWave = t =>
-            -DAMPING + drivingAmp / DT_DIVIDER *
-            spectrogram.getInterpolatedAmp(t / DT_DIVIDER);
+            -DAMPING + drivingAmp *
+            spectrogram.getInterpolatedAmp(t);
         }
         startStop();
         break;
@@ -171,7 +194,8 @@ function setKeyboardHandlers() {
 
 function setMouseHandlers() {
   console.log(`click: start/stop`);
-  document.body.onclick = () => startStop();
+  document.body.onclick = e =>
+    e.target === canvas && startStop();
 }
 
 function startStop() {
@@ -180,32 +204,37 @@ function startStop() {
   running && animateWave();
 }
 
-function printStats() {
-  let [min, max, avg, stddev] = wave.getWaveStats();
+function printStats(
+  stats = wave.getWaveStats(),
+  time = performance.now()) {
 
-  let n = numSteps;
-  let ct = computeTime;
-  let xt = performance.now() - prevStatsTime;
-  let rt = renderTime;
-  let wt = wave.waveTime / DT_DIVIDER;
+  let [min, max, avg] = stats;
+
+  let ns = numSteps;
+  let ct = computeTime / 1e3;
+  let nr = numRenderedFrames;
+  let wt = wave.waveTime;
+  let n2 = wave.gridSize ** 2;
+  let dt = (time - prevStatsTime) / 1e3;
+  let dwt = wt - prevWaveTime;
+  let title = 'T+' + wt.toFixed(1) + 's';
 
   pstats.textContent = [
-    ct / n * 1e3 | 0, 'us/step',
-    xtonum(n / ct | 0, 'fps'), ';',
-    xtonum(n * wave.gridSize ** 2 / ct * 1e3, 'flops'),
-    'draw:', rt / n * 1e3 | 0, 'us',
-    xtonum(n / xt * 1e3, 'fps'),
-    'time:', wt.toFixed(3), 's;',
-    'amp:', (max - min).toExponential(1),
-    'avg', avg.toExponential(2),
-    'sigma', stddev.toExponential(2),
+    title, (dwt / dt).toFixed(2) + 'x', '|',
+    'sim', xtonum(ns / ct, 'fps'),
+    xtonum(ns / ct * n2, 'pps'),
+    (ct / dt * 100 | 0) + '%', '|',
+    'amp', (max - min).toExponential(1),
+    'avg', avg.toExponential(2), '|',
+    'draw', nr / dt | 0, 'fps'
   ].join(' ');
 
   numSteps = 0;
   computeTime = 0;
-  renderTime = 0;
+  numRenderedFrames = 0;
+  prevWaveTime = wt;
 
-  document.title = 'T+' + wt.toFixed(3) + 's';
+  document.title = title;
 }
 
 function xtonum(x, units) {
@@ -217,36 +246,43 @@ function xtonum(x, units) {
 }
 
 function animateWave() {
-  let time = performance.now();
+  let prevTime = performance.now();
 
   for (let i = 0; i < nUpdateSteps; i++)
     wave.computeNextStep();
 
-  computeTime += performance.now() - time;
+  let time = performance.now();
+  computeTime += time - prevTime;
   numSteps += nUpdateSteps;
 
-  if (time >= prevRenderTime + RENDER_INTERVAL) {
-    prevRenderTime = time;
-    renderWave();
+  if (time >= prevStatsTime + STATS_INTERVAL) {
+    let [min, max, avg, stddev] = wave.getWaveStats()
+    printStats([min, max, avg, stddev], time);
+    prevStatsTime = time;
+
+    if (stddev * 3 > WAVE_AMP_MAX || stddev * 3 < WAVE_AMP_MIN) {
+      console.log('Rescaling wave amplitude from',
+        stddev * 3, 'to', WAVE_AMP_NORMALIZED);
+      wave.normalizeAmplitude(WAVE_AMP_NORMALIZED);
+    }
   }
 
-  if (time >= prevStatsTime + STATS_INTERVAL) {
-    printStats();
-    prevStatsTime = time;
+  if (time >= prevRenderTime + RENDER_INTERVAL) {
+    renderWave();
+    prevRenderTime = time;
+    numRenderedFrames++;
   }
 
   if (running) {
-    if (UPDATE_INTERVAL > 0)
-      setTimeout(animateWave, UPDATE_INTERVAL);
+    if (RENDER_INTERVAL > 0)
+      postMessage(ANIMATE_WAVE_MESSAGE, '*');
     else
       requestAnimationFrame(animateWave);
   }
 }
 
 function renderWave() {
-  let time = performance.now();
   wave.renderWaveImage(drawIsolines);
-  renderTime += performance.now() - time;
 }
 
 function sleep(time_msec) {
@@ -312,6 +348,9 @@ function createWave(args) {
     dishSize: DISH_SIZE,
     waveSpeed: WAVE_SPEED,
     inputWave: INPUT_WAVE,
+    iterations: ITERATIONS,
+    timeStepDivider: DT_DIVIDER,
+    maxCanvasSize: MAX_CANVAS_SIZE,
     ...args
   });
 }
