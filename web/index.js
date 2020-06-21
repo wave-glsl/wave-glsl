@@ -3,13 +3,13 @@ const USP = new URLSearchParams(location.search);
 const USE_GPU = USP.get('gpu') != 0;
 const ITERATIONS = USP.get('i') === null ? 7 : +USP.get('i');
 const INITIAL_GRID_SIZE = +USP.get('n') || 128;
-const INITIAL_AMP = +USP.get('a') || 5;
+const INITIAL_AMP = +USP.get('a') || 3;
 const INITIAL_FREQ = +USP.get('f') || 20;
 const MIN_GRID_SIZE = 64;
 const MAX_GRID_SIZE = 2048;
 const RESIZE_FACTOR = 2;
 const WAVE_SPEED = +USP.get('c') || 1;
-const NOISE_AMP = 1e-3;
+const NOISE_AMP = 1e-2;
 const NOISE_FREQ = +USP.get('nf') || 0;
 const NOISE_RADIUS = 0.5;
 const EDGE_RADIUS = 0.95;
@@ -17,8 +17,8 @@ const EDGE_SHARPNESS = +USP.get('e') || 1 / INITIAL_GRID_SIZE;
 const DISH_SIZE = 1 / EDGE_RADIUS;
 const AMP_FACTOR = 1.05;
 const FREQ_FACTOR = 2 ** (1 / 12); // en.wikipedia.org/wiki/Piano_key_frequencies
-const UPDATE_STEPS = +USP.get('s') || 32;
-const DAMPING = +USP.get('g') || 1;
+const UPDATE_STEPS = +USP.get('s') || 64;
+const DAMPING = +USP.get('g') || 0;
 const MODULATION = +USP.get('m') || 1e-3;
 const cos = Math.cos;
 const sin = Math.sin;
@@ -27,14 +27,14 @@ const INPUT_WAVE_0 = t => -DAMPING + drivingAmp;
 const INPUT_WAVE_1 = t => -DAMPING + drivingAmp * cos(drivingFreq * t);
 const INPUT_WAVE_2 = t => -DAMPING + drivingAmp * cos(drivingFreq * (1 + MODULATION * sin(t / 15)) * t);
 const INPUT_WAVE_3 = t => -DAMPING + drivingAmp * (1 + MODULATION * sin(t / 15)) * cos(drivingFreq * t);
-const INPUT_WAVE = INPUT_WAVE_2;
+const INPUT_WAVE = INPUT_WAVE_1;
 const WAVE_FILENAME = 'wave_surface.obj'
 const RING_FILENAME = 'led_ring.obj';
 const MAX_CANVAS_SIZE = 1024;
-const DT_DIVIDER = Math.max(1, +USP.get('dt') || 0);
-const WAVE_AMP_MAX = 1e-1;
-const WAVE_AMP_MIN = 1e-10;
-const WAVE_AMP_NORMALIZED = 1e-4;
+const DT_DIVIDER = +USP.get('dt') || 2;
+const WAVE_AMP_MAX = 1e+3;
+const WAVE_AMP_MIN = 1e-3;
+const WAVE_AMP_NORMALIZED = 1;
 const ANIMATE_WAVE_MESSAGE = 'wave-update';
 
 const UPDATE_INTERVAL = 0;
@@ -71,8 +71,8 @@ async function main() {
   setMouseHandlers();
   setUpdateMessageHandler();
 
-  wave.setInitialWave(NOISE_AMP, NOISE_FREQ, NOISE_RADIUS);
   wave.setInitialEdge(EDGE_RADIUS, EDGE_SHARPNESS);
+  addWaveSplash();
   renderWave();
 }
 
@@ -91,7 +91,7 @@ function setKeyboardHandlers() {
   console.log('m: microphone spectrogram recording');
   console.log('i: switch between rgba <-> isolines');
   console.log('u: upsize wave grid for better quality');
-  console.log('d: downsize wave grid for fatser simulation');
+  console.log('d: downsize wave grid for faster simulation');
   console.log('z: decrease driving freq');
   console.log('x: increase driving freq');
   console.log('c: decrease driving amp');
@@ -100,9 +100,13 @@ function setKeyboardHandlers() {
   console.log('n: increase speed');
   console.log('w: make a wavefront obj file');
   console.log('a: normalize wave amplitude 3*sigma -> 1.0');
+  console.log('f: upload an audio file');
 
   document.onkeypress = e => {
     switch (e.key) {
+      case 'f':
+        selectAudioFile();
+        break;
       case 'a':
         console.log('Normalizing wave amplitude');
         wave.normalizeAmplitude();
@@ -162,9 +166,21 @@ function setKeyboardHandlers() {
           console.log('Using recorded sound as input:',
             spectrogram.recordedSound.length *
             spectrogram.frameSize | 0, 'sec');
+          // The max volume in WebAudio is about -30 dB = 0.03 m.
+          // The max audible frequency is 10 kHz, which is about
+          // the range of piano key frequencies; also most bird songs
+          // fit into the 6 kHz range (www.fssbirding.org.uk). At the
+          // same time, the NxN grid simulation can't possibly render
+          // a cos(2pi*w*x) wave with w > N/2, as in the extreme case
+          // a "wave" will be represented by alternating pixels +1/-1.
+          // In practice, it can deal with w < N/sqrt(2), apparently
+          // using the diagonal length, and beyond that the simulation
+          // turns into noise. For this reason, the 10 kHz range is
+          // scaled into N/2.
           wave.inputWave = t =>
-            -DAMPING + drivingAmp *
-            spectrogram.getInterpolatedAmp(t);
+            -DAMPING + drivingAmp * 30 *
+            spectrogram.getInterpolatedAmp(
+              t / 10e3 * wave.gridSize / 2 ** 0.5);
         }
         startStop();
         break;
@@ -178,24 +194,84 @@ function setKeyboardHandlers() {
         renderWave();
         break;
       case 'm':
-        if (!spectrogram) {
-          canvas.hidden = true;
-          audioCanvas = document.createElement('canvas');
-          audioCanvas.width = MAX_CANVAS_SIZE;
-          audioCanvas.height = MAX_CANVAS_SIZE;
-          document.body.appendChild(audioCanvas);
-          spectrogram = new Spectrogram(audioCanvas);
-          spectrogram.start();
-        }
+        startAudioRecording();
         break;
     }
   };
 }
 
+function startAudioRecording(audioStream = null) {
+  if (!spectrogram) {
+    console.log('Creating a <canvas> for the spectrogram');
+    canvas.hidden = true;
+    audioCanvas = document.createElement('canvas');
+    audioCanvas.width = MAX_CANVAS_SIZE;
+    audioCanvas.height = MAX_CANVAS_SIZE;
+    document.body.appendChild(audioCanvas);
+    spectrogram = new Spectrogram(audioCanvas);
+    spectrogram.start(audioStream);
+  } else {
+    console.warn('Spectrogram already running');
+  }
+}
+
+async function selectAudioFile() {
+  console.log('Creating an <input> to pick a file');
+  let input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'audio/mpeg';
+  input.click();
+
+  let file = await new Promise((resolve, reject) => {
+    input.onchange = () => {
+      let files = input.files || [];
+      if (files.length > 0)
+        resolve(files[0]);
+      else
+        reject(new Error(`No files selected`));
+    };
+  });
+
+  console.log('Selected file:', file.type, file.size, 'bytes');
+
+  console.log('Creating an <audio> element to render the file');
+  let audio = document.createElement('audio');
+  audio.src = URL.createObjectURL(file);
+
+  await new Promise(resolve => {
+    audio.onloadeddata =
+      () => resolve();
+  });
+
+  console.log('Audio loaded');
+  audio.loop = true;
+  audio.play();
+
+  let stream = audio.captureStream();
+  console.log('Got media stream from <audio>:', stream.id,
+    'tracks:', stream.getTracks().map(t => t));
+
+  startAudioRecording(stream);
+}
+
 function setMouseHandlers() {
   console.log(`click: start/stop`);
-  document.body.onclick = e =>
-    e.target === canvas && startStop();
+  document.body.onclick = e => {
+    if (e.target === canvas) {
+      if (!running) {
+        let x = e.clientX / canvas.clientWidth;
+        let y = e.clientY / canvas.clientHeight;
+        addWaveSplash(x, y);
+      }
+
+      startStop();
+    }
+  };
+}
+
+function addWaveSplash(x = 0.5, y = 0.5) {
+  wave.setInitialWave(
+    NOISE_AMP, NOISE_FREQ, NOISE_RADIUS, { x, y });
 }
 
 function startStop() {
@@ -262,7 +338,7 @@ function animateWave() {
 
     if (stddev * 3 > WAVE_AMP_MAX || stddev * 3 < WAVE_AMP_MIN) {
       console.log('Rescaling wave amplitude from',
-        stddev * 3, 'to', WAVE_AMP_NORMALIZED);
+        (stddev * 3).toExponential(2), 'to', WAVE_AMP_NORMALIZED);
       wave.normalizeAmplitude(WAVE_AMP_NORMALIZED);
     }
   }
@@ -275,7 +351,7 @@ function animateWave() {
 
   if (running) {
     if (RENDER_INTERVAL > 0)
-      postMessage(ANIMATE_WAVE_MESSAGE, '*');
+      setTimeout(animateWave, 0);
     else
       requestAnimationFrame(animateWave);
   }

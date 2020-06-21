@@ -108,10 +108,15 @@ class GpuWaveSolver {
       this.gpWave.output);
   }
 
-  setInitialWave(amp, freq, radius, thickness = 1e-4) {
+  setInitialWave(amp, freq, radius, 
+    { thickness = 1e-4, x = 0.5, y = 0.5 } = {}) {
+
+    console.log(`Adding a spash at`, x.toFixed(2), y.toFixed(2));
+
     for (let frame of this.gpWave.frames) {
       this.gpCircle.run({
         output: frame,
+        x, y,
         radius,
         thickness,
         noiseAmp: amp,
@@ -1024,12 +1029,12 @@ class GpuCircleProgram {
       this.fragmentShader);
   }
 
-  run({ output, radius, thickness, noiseAmp, noiseFreq }) {
+  run({ output, radius, thickness, noiseAmp, noiseFreq, x = 0.5, y = 0.5 }) {
     let gl = this.gl;
     let gp = this.gp;
     let uf = gp.uniforms;
     gp.bind();
-    gl.uniform2f(uf.point, 0.5, 0.5);
+    gl.uniform2f(uf.point, x, 1.0 - y);
     gl.uniform1f(uf.radius, radius);
     gl.uniform1f(uf.thickness, thickness);
     gl.uniform1f(uf.noiseAmp, noiseAmp);
