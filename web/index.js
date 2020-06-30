@@ -3,8 +3,9 @@ const USP = new URLSearchParams(location.search);
 const USE_GPU = USP.get('gpu') != 0;
 const ITERATIONS = USP.get('i') === null ? 7 : +USP.get('i');
 const INITIAL_GRID_SIZE = +USP.get('n') || 128;
-const INITIAL_AMP = +USP.get('a') || 3;
+const INITIAL_AMP = param('a', 100);
 const INITIAL_FREQ = +USP.get('f') || 20;
+const SCHRODINGER = +USP.get('sch') || 0;
 const MIN_GRID_SIZE = 64;
 const MAX_GRID_SIZE = 2048;
 const RESIZE_FACTOR = 2;
@@ -12,22 +13,19 @@ const WAVE_SPEED = +USP.get('c') || 1;
 const NOISE_AMP = 1e-2;
 const NOISE_FREQ = +USP.get('nf') || 0;
 const NOISE_RADIUS = 0.5;
-const EDGE_RADIUS = 0.95;
+const DISH_SIZE = 1 + 5 / INITIAL_GRID_SIZE; // to reduce rounding error in dx=D/N
+const EDGE_RADIUS = 1 / DISH_SIZE;
 const EDGE_SHARPNESS = +USP.get('e') || 1 / INITIAL_GRID_SIZE;
-const DISH_SIZE = 1 / EDGE_RADIUS;
 const AMP_FACTOR = 1.05;
 const FREQ_FACTOR = 2 ** (1 / 12); // en.wikipedia.org/wiki/Piano_key_frequencies
+const FREQ_SCALE = +USP.get('fs') || 500;
 const UPDATE_STEPS = +USP.get('s') || 64;
 const DAMPING = +USP.get('g') || 0;
 const MODULATION = +USP.get('m') || 1e-3;
 const cos = Math.cos;
 const sin = Math.sin;
 const PI = Math.PI;
-const INPUT_WAVE_0 = t => -DAMPING + drivingAmp;
-const INPUT_WAVE_1 = t => -DAMPING + drivingAmp * cos(drivingFreq * t);
-const INPUT_WAVE_2 = t => -DAMPING + drivingAmp * cos(drivingFreq * (1 + MODULATION * sin(t / 15)) * t);
-const INPUT_WAVE_3 = t => -DAMPING + drivingAmp * (1 + MODULATION * sin(t / 15)) * cos(drivingFreq * t);
-const INPUT_WAVE = INPUT_WAVE_1;
+const INPUT_WAVE = parseInputWave(USP.get('f') || '7.77');
 const WAVE_FILENAME = 'wave_surface.obj'
 const RING_FILENAME = 'led_ring.obj';
 const MAX_CANVAS_SIZE = 1024;
@@ -44,7 +42,6 @@ const STATS_ID = '#stats';
 
 let WaveSolver = USE_GPU ? GpuWaveSolver : WasmWaveSolver;
 let nUpdateSteps = UPDATE_STEPS;
-let drivingFreq = INITIAL_FREQ;
 let drivingAmp = INITIAL_AMP;
 let running = false;
 let drawIsolines = false;
@@ -85,6 +82,11 @@ function setUpdateMessageHandler() {
   }
 }
 
+function param(name, value) {
+  let x = USP.get(name);
+  return x === null ? value : x;
+}
+
 function setKeyboardHandlers() {
   console.log('s: start/stop');
   console.log('p: one step forward');
@@ -92,8 +94,6 @@ function setKeyboardHandlers() {
   console.log('i: switch between rgba <-> isolines');
   console.log('u: upsize wave grid for better quality');
   console.log('d: downsize wave grid for faster simulation');
-  console.log('z: decrease driving freq');
-  console.log('x: increase driving freq');
   console.log('c: decrease driving amp');
   console.log('v: increase driving amp');
   console.log('b: decrease speed');
@@ -141,14 +141,6 @@ function setKeyboardHandlers() {
         drivingAmp *= AMP_FACTOR;
         console.log('driving amp:', drivingAmp);
         break;
-      case 'z':
-        drivingFreq /= FREQ_FACTOR;
-        console.log('driving freq:', drivingFreq);
-        break;
-      case 'x':
-        drivingFreq *= FREQ_FACTOR;
-        console.log('driving freq:', drivingFreq);
-        break;
       case 'u':
         resizeWave(wave.gridSize * RESIZE_FACTOR | 0);
         renderWave();
@@ -175,12 +167,13 @@ function setKeyboardHandlers() {
           // a "wave" will be represented by alternating pixels +1/-1.
           // In practice, it can deal with w < N/sqrt(2), apparently
           // using the diagonal length, and beyond that the simulation
-          // turns into noise. For this reason, the 10 kHz range is
-          // scaled into N/2.
-          wave.inputWave = t =>
-            -DAMPING + drivingAmp * 30 *
-            spectrogram.getInterpolatedAmp(
-              t / 10e3 * wave.gridSize / 2 ** 0.5);
+          // turns into noise.
+          wave.inputWave = t => {
+            let a = spectrogram.getInterpolatedAmp(t / FREQ_SCALE);
+            return [
+              a[0] * drivingAmp * 30 - DAMPING,
+              a[1] * drivingAmp * 30];
+          };
         }
         startStop();
         break;
@@ -259,8 +252,8 @@ function setMouseHandlers() {
   document.body.onclick = e => {
     if (e.target === canvas) {
       if (!running) {
-        let x = e.clientX / canvas.clientWidth;
-        let y = e.clientY / canvas.clientHeight;
+        let x = e.clientX / canvas.clientWidth * 2 - 1;
+        let y = e.clientY / canvas.clientHeight * 2 - 1;
         addWaveSplash(x, y);
       }
 
@@ -269,7 +262,7 @@ function setMouseHandlers() {
   };
 }
 
-function addWaveSplash(x = 0.5, y = 0.5) {
+function addWaveSplash(x = 0, y = 0) {
   wave.setInitialWave(
     NOISE_AMP, NOISE_FREQ, NOISE_RADIUS, { x, y });
 }
@@ -277,14 +270,19 @@ function addWaveSplash(x = 0.5, y = 0.5) {
 function startStop() {
   running = !running;
   console.log(running ? 'started' : 'stopped');
-  running && animateWave();
+  if (running) {
+    animateWave();
+  } else {
+    wave.normalizeAmplitude();
+    renderWave();
+  }
 }
 
 function printStats(
   stats = wave.getWaveStats(),
   time = performance.now()) {
 
-  let [min, max, avg] = stats;
+  let [avgx, avgy, rmax, rdev] = stats;
 
   let ns = numSteps;
   let ct = computeTime / 1e3;
@@ -300,8 +298,8 @@ function printStats(
     'sim', xtonum(ns / ct, 'fps'),
     xtonum(ns / ct * n2, 'pps'),
     (ct / dt * 100 | 0) + '%', '|',
-    'amp', (max - min).toExponential(1),
-    'avg', avg.toExponential(2), '|',
+    'amp', rmax.toExponential(1),
+    'avg', ((avgx ** 2 + avgy ** 2) ** 0.5).toExponential(2), '|',
     'draw', nr / dt | 0, 'fps'
   ].join(' ');
 
@@ -427,6 +425,7 @@ function createWave(args) {
     iterations: ITERATIONS,
     timeStepDivider: DT_DIVIDER,
     maxCanvasSize: MAX_CANVAS_SIZE,
+    schrodinger: SCHRODINGER,
     ...args
   });
 }
@@ -543,4 +542,29 @@ function createWaveSurfaceMesh() {
   }
 
   return text.join('\n');
+}
+
+function parseInputWave(str) {
+  if (/^(\d+(\.\d+)?,?)+$/.test(str)) {
+    let freqs = str.split(',')
+      .map(s => parseFloat(s) || 0);
+    console.log('freqs:', freqs);
+    return t => {
+      let re = 0;
+      let im = 0;
+
+      for (let freq of freqs) {
+        re += cos(freq * t);
+        im += sin(freq * t);
+      }
+
+      return [
+        re * drivingAmp - DAMPING,
+        im * drivingAmp,
+      ];
+    };
+  }
+
+  console.error('Invalid freqs spec: ?f=' + freqs);
+  return t => -DAMPING;
 }

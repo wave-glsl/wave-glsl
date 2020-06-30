@@ -1,9 +1,9 @@
-const RGB = [
-  [255, 255, 255],
-  [255, 0, 0],
-  [0, 255, 0],
-  [0, 0, 255],
-  [0, 0, 0],
+const AMP_COLORS = [
+  [0, 0, 0], // -99 dB -> 1e-5
+  [0, 0, 1], // -80 dB -> 1e-4
+  [0, 1, 0], // -60 dB -> 1e-3
+  [1, 0, 0], // -40 dB -> 1e-2
+  [1, 1, 1], // -20 dB -> 1e-1
 ];
 
 class Spectrogram {
@@ -16,8 +16,8 @@ class Spectrogram {
     this.sampleRate = this.audioCtx.sampleRate;
     this.frameSize = this.analyser.frequencyBinCount
       / this.sampleRate;
-    this.maxAmplitude = 10 ** (this.analyser.maxDecibels / 20);
-    this.minAmplitude = 10 ** (this.analyser.minDecibels / 20);
+    this.maxAmplitude = 10 ** (this.analyser.maxDecibels / 20); // 3e-3
+    this.minAmplitude = 10 ** (this.analyser.minDecibels / 20); // 1e-5
 
     this.dataArray = new Uint8Array(
       this.analyser.frequencyBinCount);
@@ -48,13 +48,7 @@ class Spectrogram {
       this.dataArray.length * this.maxTimeSteps / 1024 | 0, 'KB');
     let [dbmin, dbmax] = [a.minDecibels, a.maxDecibels];
     console.log('decibel range:', dbmin, '..', dbmax, 'dB');
-    let db = n => (10 ** ((n / 255 * (dbmax - dbmin) + dbmin) / 20)).toExponential(2);
-    console.log('amplitude colors:',
-      '\n\twhite:', db(256),
-      '\n\tred:', db(192),
-      '\n\tgreen:', db(128),
-      '\n\tblue:', db(64),
-      '\n\tblack:', db(0));
+    console.log('amplitude colors: red=0.01 green=0.001, blue=0.0001');
   }
 
   async stop() {
@@ -103,7 +97,7 @@ class Spectrogram {
       let x = t / tmax * w | 0;
       let y = h - 1 - (i / dmax * h | 0);
       let p = 4 * (y * w + x);
-      let [r, g, b] = this.getInterpolatedColor(1 - d[i] / 255);
+      let [r, g, b] = this.getInterpolatedColor(d[i] / 255);
       rgba[p + 0] = r;
       rgba[p + 1] = g;
       rgba[p + 2] = Math.max(b, Math.exp(-3e5 * ds ** 2) * 255);
@@ -114,10 +108,16 @@ class Spectrogram {
     this.timeStep++;
   }
 
-  getInterpolatedColor(x) {
-    x = Math.max(0, Math.min(1, x));
+  getInterpolatedColor(dbamp) {
+    let dbmax = this.analyser.maxDecibels;
+    let dbmin = this.analyser.minDecibels;
 
-    let r = RGB;
+    // -5 for -100 dB .. -1 for -20 dB
+    let dblog = (dbamp * (dbmax - dbmin) + dbmin) / 20;
+    // Rescale -5..-1 to 0..1.
+    let x = Math.max(0, Math.min(1, (dblog + 5) / 4));
+
+    let r = AMP_COLORS;
     let n = r.length;
     let i = x * (n - 1) | 0;
     let j = Math.min(i + 1, n - 1);
@@ -126,9 +126,9 @@ class Spectrogram {
     let b = r[j];
 
     return [
-      a[0] * (1 - s) + b[0] * s,
-      a[1] * (1 - s) + b[1] * s,
-      a[2] * (1 - s) + b[2] * s,
+      255 * (a[0] * (1 - s) + b[0] * s) | 0,
+      255 * (a[1] * (1 - s) + b[1] * s) | 0,
+      255 * (a[2] * (1 - s) + b[2] * s) | 0,
     ];
   }
 
@@ -141,7 +141,7 @@ class Spectrogram {
     let rst = rs[ti];
     let nfreq = rst.length; // = frequencyBinCount
     let dfreq = this.sampleRate / 2 / nfreq;
-    let sum = 0;
+    let sum = [0, 0];
 
     for (let fi = 1; fi < nfreq; fi++) {
       if (!rst[fi]) continue;
@@ -149,7 +149,8 @@ class Spectrogram {
       let db = rst[fi] / 256 * (dbMax - dbMin) + dbMin;
       let energy = 10 ** (db / 10);
       let amp = energy ** 0.5;
-      sum += amp * Math.cos(t * freq);
+      sum[0] += amp * Math.cos(t * freq);
+      sum[1] += amp * Math.sin(t * freq);
     }
 
     return sum;

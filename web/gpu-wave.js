@@ -11,6 +11,10 @@ class GpuWaveSolver {
     this.timeStep = this.gridStep / this.waveSpeed / 2 / args.timeStepDivider;
     this.waveTime = args.waveTime || 0;
     this.iterations = args.iterations;
+    this.schrodinger = args.schrodinger;
+
+    if (this.schrodinger)
+      this.timeStep = this.gridStep ** 2 / args.timeStepDivider;
   }
 
   init() {
@@ -18,13 +22,13 @@ class GpuWaveSolver {
     canvas.width = Math.min(this.maxCanvasSize, this.gridSize);
     canvas.height = Math.min(this.maxCanvasSize, this.gridSize);
     this.gpuContext.init();
-    this.tempBuffer = this.gpuContext.createFrameBuffer(this.gridSize);
-    this.gpCircle = new GpuCircleProgram(this.gpuContext.gl);
+    this.tempWave = this.gpuContext.createFrameBuffer(this.gridSize, 2);
+    this.gpSplash = new GpuSplashProgram(this.gpuContext.gl);
     this.gpBoundary = new GpuBoundaryProgram(this.gpuContext, this.gridSize);
 
-    const ctor = this.iterations > 0 ?
-      GpuWaveImplicitProgram :
-      GpuWaveExplicitProgram;
+    const ctor = this.schrodinger ? GpuSWaveProgram :
+      this.iterations > 0 ? GpuWaveImplicitProgram :
+        GpuWaveProgram;
 
     this.gpWave = new ctor(this.gpuContext, {
       iterations: this.iterations,
@@ -37,25 +41,13 @@ class GpuWaveSolver {
 
     this.gpRescale = new GpuRescalingProgram(this.gpuContext);
 
-    this.gpVelocity = new GpuVelocityProgram(this.gpuContext, {
-      size: this.gridSize,
-      dt: this.timeStep,
-    });
-
     this.gpAmpStats = new GpuStatsProgram(this.gpuContext, {
-      size: this.gridSize,
-      dx: this.gridStep,
-    });
-
-    this.gpVelocityStats = new GpuStatsProgram(this.gpuContext, {
       size: this.gridSize,
       dx: this.gridStep,
     });
 
     this.gpDisplay = new GpuDisplayProgram(this.gpuContext.gl, {
       stats: this.gpAmpStats.output,
-      vstats: this.gpVelocityStats.output,
-      velocity: this.gpVelocity.output,
       size: this.gridSize,
       dx: this.gridStep,
     });
@@ -70,59 +62,58 @@ class GpuWaveSolver {
 
   getWaveStats() {
     this.gpAmpStats.run(this.gpWave.output);
-    let [min, max, avg, m2] = this.gpAmpStats.read();
-    return [min, max, avg, m2 ** 0.5 / this.gridSize];
+    let [avgx, avgy, rmax, m2] = this.gpAmpStats.read();
+    return [avgx, avgy, rmax, m2 ** 0.5 / this.gridSize];
   }
 
   normalizeAmplitude(maxamp = 1e-3) {
-    let [min, max, average, stddev] = this.getWaveStats();
+    let [avgx, avgy, rmax, stddev] = this.getWaveStats();
+
+    if (!Number.isFinite(stddev))
+      return;
 
     for (let frame of this.gpWave.frames) {
       this.gpRescale.run({
-        output: this.tempBuffer,
+        output: this.tempWave,
         input: frame,
-        shift: -average,
+        shift: [-avgx, -avgy],
         scale: maxamp / (3 * stddev),
       });
 
       // Same as copying.
       this.gpRescale.run({
         output: frame,
-        input: this.tempBuffer,
+        input: this.tempWave,
       });
     }
   }
 
   renderWaveImage() {
-    // console.log('drawing a frame');
     this.gpAmpStats.run(
       this.gpWave.output);
-
-    this.gpVelocity.run(
-      ...this.gpWave.frames);
-
-    this.gpVelocityStats.run(
-      this.gpVelocity.output);
 
     this.gpDisplay.run(
       this.gpWave.output);
   }
 
-  setInitialWave(amp, freq, radius, 
-    { thickness = 1e-4, x = 0.5, y = 0.5 } = {}) {
-
+  setInitialWave(amp, freq, radius, { x = 0, y = 0 } = {}) {
     console.log(`Adding a spash at`, x.toFixed(2), y.toFixed(2));
 
+    let gl = this.gpuContext.gl;
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+
     for (let frame of this.gpWave.frames) {
-      this.gpCircle.run({
+      this.gpSplash.run({
         output: frame,
         x, y,
         radius,
-        thickness,
-        noiseAmp: amp,
-        noiseFreq: freq,
+        amplitude: amp,
+        angularFreq: freq,
       });
     }
+
+    gl.disable(gl.BLEND);
   }
 
   setInitialEdge(radius, sharpness = 0.01, thickness = 1e-4) {
@@ -178,9 +169,10 @@ class GpuContext {
 
     let gl = this.gl;
     let type = this.ext.floatTexType;
-    let fmt = components == 1 ?
-      this.ext.formatR :
-      this.ext.formatRGBA;
+    let fmt =
+      components == 1 ? this.ext.formatR :
+        components == 2 ? this.ext.formatRG :
+          this.ext.formatRGBA;
 
     gl.activeTexture(gl.TEXTURE0);
     let texture = gl.createTexture();
@@ -432,10 +424,52 @@ class GpuLaplaceVertexShader {
   }
 }
 
-class GpuWaveExplicitProgram {
+class GpuWaveProgram {
   get output() {
     return this.frames[0];
   }
+
+  static utils = `
+    // en.wikipedia.org/wiki/Discrete_Laplace_operator
+    vec2 diffuse(sampler2D uPrev1) {
+      vec2 u1 = texture2D(uPrev1, vUv).xy;
+
+      vec2 uL = texture2D(uPrev1, vL).xy;
+      vec2 uR = texture2D(uPrev1, vR).xy;
+      vec2 uT = texture2D(uPrev1, vT).xy;
+      vec2 uB = texture2D(uPrev1, vB).xy;
+
+      vec2 uLT = texture2D(uPrev1, vLT).xy;
+      vec2 uRT = texture2D(uPrev1, vRT).xy;
+      vec2 uLB = texture2D(uPrev1, vLB).xy;
+      vec2 uRB = texture2D(uPrev1, vRB).xy;
+      
+      return
+        + 0.25 * (uLT - u1)
+        + 0.25 * (uRT - u1)
+        + 0.25 * (uLB - u1)
+        + 0.25 * (uRB - u1)
+        + 0.50 * (uL - u1)
+        + 0.50 * (uR - u1)
+        + 0.50 * (uT - u1)
+        + 0.50 * (uB - u1);
+    }
+
+    vec2 xmul(vec2 a, vec2 b) {
+      return vec2(
+        a.x*b.x - a.y*b.y,
+        a.x*b.y + a.y*b.x);
+    }
+
+    vec2 xinv(vec2 a) {
+      float r2 = dot(a, a);
+      return vec2(a.x / r2, -a.y / r2);
+    }
+
+    vec2 xdiv(vec2 a, vec2 b) {
+      return xmul(a, xinv(b));
+    }
+  `;
 
   constructor(gpuContext, { boundary, size, speed, dx, dt }) {
     console.log('Explicit wave solver:', size, 'dt', dt);
@@ -447,9 +481,9 @@ class GpuWaveExplicitProgram {
     this.boundary = boundary;
 
     this.frames = [
-      gpuContext.createFrameBuffer(size),
-      gpuContext.createFrameBuffer(size),
-      gpuContext.createFrameBuffer(size),
+      gpuContext.createFrameBuffer(size, 2),
+      gpuContext.createFrameBuffer(size, 2),
+      gpuContext.createFrameBuffer(size, 2),
     ];
 
     this.vertexShader = GpuLaplaceVertexShader.get(gl);
@@ -473,52 +507,25 @@ class GpuWaveExplicitProgram {
         uniform sampler2D uBoundary;
         uniform sampler2D uPrev1;
         uniform sampler2D uPrev2;
-        uniform float inputAmp;
+        uniform vec2 inputAmp;
         uniform float dt;
 
-        // en.wikipedia.org/wiki/Discrete_Laplace_operator
-        float diffuse(sampler2D uPrev1) {
-          float u1 = texture2D(uPrev1, vUv).r;
-
-          float uL = texture2D(uPrev1, vL).r;
-          float uR = texture2D(uPrev1, vR).r;
-          float uT = texture2D(uPrev1, vT).r;
-          float uB = texture2D(uPrev1, vB).r;
-
-          float uLT = texture2D(uPrev1, vLT).r;
-          float uRT = texture2D(uPrev1, vRT).r;
-          float uLB = texture2D(uPrev1, vLB).r;
-          float uRB = texture2D(uPrev1, vRB).r;
-          
-          return
-            + 0.25 * (uLT - u1)
-            + 0.25 * (uRT - u1)
-            + 0.25 * (uLB - u1)
-            + 0.25 * (uRB - u1)
-            + 0.50 * (uL - u1)
-            + 0.50 * (uR - u1)
-            + 0.50 * (uT - u1)
-            + 0.50 * (uB - u1);
-        }
+        ${GpuWaveProgram.utils}
 
         void main () {
-            float c = ${speed * dt / dx};
-            float g = ${0.5 * dt}*inputAmp;
-
+            float c2 = ${(speed * dt / dx) ** 2};
+            vec2 g2 = ${0.5 * dt}*inputAmp;
             float b = texture2D(uBoundary, vUv).r;
 
-            float u2 = texture2D(uPrev2, vUv).r;
-            float u1 = texture2D(uPrev1, vUv).r;
+            vec2 u2 = texture2D(uPrev2, vUv).xy;
+            vec2 u1 = texture2D(uPrev1, vUv).xy;
 
-            float diff = diffuse(uPrev1);
+            vec2 diff = diffuse(uPrev1);
 
-            // damping, to keep |u| stable in the -1..+1 range
-            g = g * exp(-u1*u1); 
-
-            float u0 = 2.0*u1 - (1.0 + g)*u2 + c*c*diff;
-            u0 = u0 * (1.0 - b) / (1.0 - g);
+            vec2 u0 = u1 + (u1 - u2) - xmul(g2, u2) + c2*diff;
+            u0 = xmul(u0 * (1.0 - b), xinv(vec2(1.0, 0.0) - g2));
             
-            gl_FragColor = vec4(u0);
+            gl_FragColor = vec4(u0, 0.0, 0.0);
         }
     `);
 
@@ -536,7 +543,7 @@ class GpuWaveExplicitProgram {
     let gp = this.gp;
     let uf = gp.uniforms;
     gp.bind();
-    gl.uniform1f(uf.inputAmp, force);
+    gl.uniform2f(uf.inputAmp, force[0], force[1]);
     gl.uniform1f(uf.dx, this.dx);
     gl.uniform1i(uf.uBoundary, this.boundary.attach(0));
     gl.uniform1i(uf.uPrev1, f0.attach(1));
@@ -604,50 +611,27 @@ class GpuWaveImplicitRhsProgram {
 
         uniform sampler2D uPrev1;
         uniform sampler2D uPrev2;
-        uniform float g;
+        uniform vec2 g;
 
-        // en.wikipedia.org/wiki/Discrete_Laplace_operator
-        float diffuse(sampler2D uPrev1) {
-          float u1 = texture2D(uPrev1, vUv).r;
-
-          float uL = texture2D(uPrev1, vL).r;
-          float uR = texture2D(uPrev1, vR).r;
-          float uT = texture2D(uPrev1, vT).r;
-          float uB = texture2D(uPrev1, vB).r;
-
-          float uLT = texture2D(uPrev1, vLT).r;
-          float uRT = texture2D(uPrev1, vRT).r;
-          float uLB = texture2D(uPrev1, vLB).r;
-          float uRB = texture2D(uPrev1, vRB).r;
-          
-          return
-            + 0.25 * (uLT - u1)
-            + 0.25 * (uRT - u1)
-            + 0.25 * (uLB - u1)
-            + 0.25 * (uRB - u1)
-            + 0.50 * (uL - u1)
-            + 0.50 * (uR - u1)
-            + 0.50 * (uT - u1)
-            + 0.50 * (uB - u1);
-        }
+        ${GpuWaveProgram.utils}
 
         void main () {
           float a2 = ${(speed * dt / dx) ** 2}; // = 1/4
-          float gt = ${0.5 * dt}*g; // |gt| < 2/dt
+          vec2 gt = ${0.5 * dt}*g; // |gt| < 2/dt
 
-            float u1 = texture2D(uPrev1, vUv).r;
-            float u2 = texture2D(uPrev2, vUv).r;
+          vec2 u1 = texture2D(uPrev1, vUv).xy;
+          vec2 u2 = texture2D(uPrev2, vUv).xy;
 
-            float d1 = diffuse(uPrev1);
-            float d2 = diffuse(uPrev2);
+          vec2 d1 = diffuse(uPrev1);
+          vec2 d2 = diffuse(uPrev2);
 
-            float b =
-            + 2.0 * u1 
+          vec2 b =
+            + u1 + (u1 - u2)
+            - xmul(gt, u2)
             + 2.0/3.0 * a2 * d1
-            - (1.0 + gt) * u2 
             + 1.0/6.0 * a2 * d2;
 
-            gl_FragColor = vec4(b);
+          gl_FragColor = vec4(b, 0.0, 0.0);
         }
     `);
 
@@ -660,7 +644,7 @@ class GpuWaveImplicitRhsProgram {
   run({ force, wave1, wave2, output }) {
     let vars = this.gp.uniforms;
     this.gp.bind();
-    this.gl.uniform1f(vars.g, force);
+    this.gl.uniform2f(vars.g, force[0], force[1]);
     this.gl.uniform1f(vars.dx, this.dx);
     this.gl.uniform1i(vars.uPrev1, wave1.attach(0));
     this.gl.uniform1i(vars.uPrev2, wave2.attach(1));
@@ -697,44 +681,21 @@ class GpuWaveImplicitStepProgram {
 
         uniform sampler2D uRhs; // b in Ax=b
         uniform sampler2D uWave; // x in Ax=b
-        uniform float g;
+        uniform vec2 g;
 
-        // en.wikipedia.org/wiki/Discrete_Laplace_operator
-        float diffuse(sampler2D uPrev1) {
-          float u1 = texture2D(uPrev1, vUv).r;
-
-          float uL = texture2D(uPrev1, vL).r;
-          float uR = texture2D(uPrev1, vR).r;
-          float uT = texture2D(uPrev1, vT).r;
-          float uB = texture2D(uPrev1, vB).r;
-
-          float uLT = texture2D(uPrev1, vLT).r;
-          float uRT = texture2D(uPrev1, vRT).r;
-          float uLB = texture2D(uPrev1, vLB).r;
-          float uRB = texture2D(uPrev1, vRB).r;
-          
-          return
-            + 0.25 * (uLT - u1)
-            + 0.25 * (uRT - u1)
-            + 0.25 * (uLB - u1)
-            + 0.25 * (uRB - u1)
-            + 0.50 * (uL - u1)
-            + 0.50 * (uR - u1)
-            + 0.50 * (uT - u1)
-            + 0.50 * (uB - u1);
-        }
+        ${GpuWaveProgram.utils}
 
         void main () {
           float a2 = ${(speed * dt / dx) ** 2}; // = 1/4
-          float gt = ${0.5 * dt}*g; // |gt| < 2/dt
+          vec2 gt = ${0.5 * dt}*g; // |gt| < 2/dt
 
-            float b1 = texture2D(uRhs, vUv).r;
-            float u1 = texture2D(uWave, vUv).r;
-            float d1 = diffuse(uWave);
-            float y1 = 1.0 - gt + 0.5*a2;
-            float u2 = b1 + a2/6.0 * (d1 + 3.0*u1);
+          vec2 b1 = texture2D(uRhs, vUv).xy;
+          vec2 u1 = texture2D(uWave, vUv).xy;
+          vec2 d1 = diffuse(uWave);
+          vec2 y1 = vec2(1.0 + 0.5*a2, 0.0) - gt;
+          vec2 u2 = b1 + a2/6.0 * (d1 + 3.0*u1);
 
-            gl_FragColor = vec4(u2 / y1);
+          gl_FragColor = vec4(xdiv(u2, y1), 0.0, 0.0);
         }
     `);
 
@@ -747,7 +708,7 @@ class GpuWaveImplicitStepProgram {
   run({ force, input, rhs, output }) {
     let vars = this.gp.uniforms;
     this.gp.bind();
-    this.gl.uniform1f(vars.g, force);
+    this.gl.uniform2f(vars.g, force[0], force[1]);
     this.gl.uniform1f(vars.dx, this.dx);
     this.gl.uniform1i(vars.uRhs, rhs.attach(0));
     this.gl.uniform1i(vars.uWave, input.attach(1));
@@ -782,13 +743,13 @@ class GpuWaveImplicitProgram {
     this.gpStep = new GpuWaveImplicitStepProgram(
       gpuContext, { speed, dx, dt });
 
-    this.rhs = gpuContext.createFrameBuffer(size);
-    this.wave = gpuContext.createFrameBuffer(size);
+    this.rhs = gpuContext.createFrameBuffer(size, 2);
+    this.wave = gpuContext.createFrameBuffer(size, 2);
 
     this.frames = [
-      gpuContext.createFrameBuffer(size),
-      gpuContext.createFrameBuffer(size),
-      gpuContext.createFrameBuffer(size),
+      gpuContext.createFrameBuffer(size, 2),
+      gpuContext.createFrameBuffer(size, 2),
+      gpuContext.createFrameBuffer(size, 2),
     ];
 
     this.vertexShader = GpuSingleVertexShader.get(gl);
@@ -804,9 +765,9 @@ class GpuWaveImplicitProgram {
 
         void main () {
             float b1 = texture2D(uBoundary, vUv).r;
-            float u1 = texture2D(uWave, vUv).r;
+            vec2 u1 = texture2D(uWave, vUv).xy;
             
-            gl_FragColor = vec4(u1 * (1.0 - b1));
+            gl_FragColor = vec4(u1 * (1.0 - b1), 0.0, 0.0);
         }
     `);
 
@@ -872,107 +833,54 @@ class GpuWaveImplicitProgram {
   }
 }
 
-class GpuVelocityProgram {
-  constructor(gpuContext, { size, dt }) {
-    let gl = gpuContext.gl;
-
-    this.gl = gl;
-    this.output = gpuContext.createFrameBuffer(size);
-
-    this.vertexShader = GpuSingleVertexShader.get(gl);
-
-    this.fragmentShader = GpuProgram.createFragmentShader(gl, `
-        precision highp float;
-        precision highp sampler2D;
-
-        varying vec2 vUv;
-
-        uniform float dt;
-        uniform sampler2D uWave;
-        uniform sampler2D uPrev;
-
-        void main () {
-            float u0 = texture2D(uWave, vUv).r;
-            float u1 = texture2D(uPrev, vUv).r;
-            float v = (u0 - u1) / ${dt};
-            gl_FragColor = vec4(v);
-        }
-    `);
-
-    this.gp = new GpuProgram(
-      this.gl,
-      this.vertexShader,
-      this.fragmentShader);
-  }
-
-  run(wave, prev) {
-    let gl = this.gl;
-    let gp = this.gp;
-    let uf = gp.uniforms;
-    gp.bind();
-    gl.uniform1i(uf.uWave, wave.attach(0));
-    gl.uniform1i(uf.uPrev, prev.attach(1));
-    GpuProgram.blit(gl, this.output);
-  }
-}
-
 class GpuDisplayProgram {
-  constructor(gl, { stats, velocity, vstats, dx, size }) {
+  constructor(gl, { stats, size }) {
     this.gl = gl;
 
     this.stats = stats;
-    this.velocity = velocity;
-    this.vstats = vstats;
-    this.dx = dx;
 
-    this.vertexShader = GpuLaplaceVertexShader.get(gl);
+    this.vertexShader = GpuProgram.createVertexShader(gl, `
+      precision highp float;
+      attribute vec2 aPosition;
+      varying vec2 vUv;
+
+      void main () {
+          // The texture2D() coordinates are in the 0..1 range,
+          // hence mapping from -1..+1 to 0..1. All math operations
+          // map this vUv back to the -1 < x < +1 space.
+          vUv = aPosition * 0.5 + 0.5;
+
+          // The wave texture is mapped 1:1 to the canvas.
+          gl_Position = vec4(aPosition, 0.0, 1.0);
+      }
+    `);
 
     this.fragmentShader = GpuProgram.createFragmentShader(gl, `
         precision highp float;
         precision highp sampler2D;
 
         varying vec2 vUv;
-        varying vec2 vL;
-        varying vec2 vR;
-        varying vec2 vT;
-        varying vec2 vB;        
 
         uniform sampler2D uAmpStats;
-        uniform sampler2D uVelocity;
-        uniform sampler2D uVelocityStats;
         uniform sampler2D uWave;
 
+        // All components are in the range 0..1, including hue.
+        vec3 hsv2rgb(vec3 c) {
+            vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+            vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+            return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+        }        
+
         void main () {
-            vec4 ampStats = texture2D(uAmpStats, vec2(0.0, 0.0));
-            vec4 velStats = texture2D(uVelocityStats, vec2(0.0, 0.0));
-            
-            float umin = ampStats.x;
-            float umax = ampStats.y;
-            float uavg = ampStats.z;
-            float um2 = ampStats.w;
-            float udev = sqrt(um2) / ${size.toFixed(1)};
+            vec4 stats = texture2D(uAmpStats, vec2(0.0, 0.0));
+            float rdev = sqrt(stats.w) / ${size.toFixed(1)};
+            vec2 u = texture2D(uWave, vUv).xy;
 
-            float vmin = velStats.x;
-            float vmax = velStats.y;
-            float vavg = velStats.z;
-            float vm2 = velStats.w;
-            float vdev = sqrt(vm2) / ${size.toFixed(1)};
+            float rad = length(u) / (rdev * 3.0);
+            float arg = atan(u.y, u.x) / ${2 * Math.PI} + 0.5;
 
-            float v = texture2D(uVelocity, vUv).r;
-            float u = texture2D(uWave, vUv).r;
-            float uL = texture2D(uWave, vL).r;
-            float uR = texture2D(uWave, vR).r;
-            float uT = texture2D(uWave, vT).r;
-            float uB = texture2D(uWave, vB).r;
-
-            float uNorm = (u - uavg) / (udev * 3.0);
-            float vNorm = (v - vavg) / (vdev * 3.0);
-
-            float r = clamp(+uNorm, 0.0, 1.0);
-            float g = clamp(-uNorm, 0.0, 1.0);
-            float b = clamp(abs(vNorm), 0.0, 1.0);
-
-            gl_FragColor = vec4(r, g, b, 1.0);
+            vec3 rgb = hsv2rgb(vec3(arg, 1.0, rad));
+            gl_FragColor = vec4(rgb, 1.0);
         }
     `);
 
@@ -987,16 +895,13 @@ class GpuDisplayProgram {
     let gp = this.gp;
     let uf = gp.uniforms;
     gp.bind();
-    gl.uniform1f(uf.dx, this.dx);
     gl.uniform1i(uf.uWave, input.attach(0));
-    gl.uniform1i(uf.uVelocity, this.velocity.attach(1));
-    gl.uniform1i(uf.uAmpStats, this.stats.attach(2));
-    gl.uniform1i(uf.uVelocityStats, this.vstats.attach(3));
+    gl.uniform1i(uf.uAmpStats, this.stats.attach(1));
     GpuProgram.blit(gl, null); // null = canvas
   }
 }
 
-class GpuCircleProgram {
+class GpuSplashProgram {
   constructor(gl) {
     this.gl = gl;
 
@@ -1009,17 +914,20 @@ class GpuCircleProgram {
         uniform vec2 point;
         uniform float radius;
         uniform float thickness;
-        uniform float noiseAmp;
-        uniform float noiseFreq;
+        uniform float amplitude;
+        uniform float angularFreq;
+        uniform float radialFreq;
 
         void main () {
-            vec2 v = 2.0 * (vUv - point);
+            vec2 v = vUv * 2.0 - 1.0 - point;
             float r = length(v);
             float d = r - radius;
             float h = exp(-1.0/thickness * d*d);
             float a = r > 0.0 ? acos(v.x / r) * sign(v.y) : 0.0;
-            float z = h * cos(a * noiseFreq) * noiseAmp;
-            gl_FragColor = vec4(z);
+            float z = amplitude * h 
+              * cos(a * angularFreq)
+              * cos(d * radialFreq * ${2 * Math.PI});
+            gl_FragColor = vec4(z, 0.0, 0.0, 0.0);
         }
     `);
 
@@ -1029,16 +937,25 @@ class GpuCircleProgram {
       this.fragmentShader);
   }
 
-  run({ output, radius, thickness, noiseAmp, noiseFreq, x = 0.5, y = 0.5 }) {
+  run({ output,
+    amplitude = 0.01,
+    thickness = 1e-3,
+    radius = 1.0,
+    angularFreq = 0,
+    radialFreq = 0,
+    x = 0, y = 0 }) {
+
     let gl = this.gl;
     let gp = this.gp;
     let uf = gp.uniforms;
+
     gp.bind();
-    gl.uniform2f(uf.point, x, 1.0 - y);
+    gl.uniform2f(uf.point, x, -y);
     gl.uniform1f(uf.radius, radius);
     gl.uniform1f(uf.thickness, thickness);
-    gl.uniform1f(uf.noiseAmp, noiseAmp);
-    gl.uniform1f(uf.noiseFreq, noiseFreq);
+    gl.uniform1f(uf.amplitude, amplitude);
+    gl.uniform1f(uf.angularFreq, angularFreq);
+    gl.uniform1f(uf.radialFreq, radialFreq);
     GpuProgram.blit(gl, output);
   }
 }
@@ -1063,13 +980,13 @@ class GpuBoundaryProgram {
         uniform float thickness;
 
         void main () {
-            vec2 v = 2.0 * (vUv - center); //  -1 .. +1
+            vec2 v = vUv * 2.0 - 1.0 - center;
             float r = length(v);
             float d = r - radius;
             float e = d > -sharpness ? 1.0 :
               d < -2.0*sharpness ? 0.0 :
               exp(-1.0/thickness * d*d);
-            gl_FragColor = vec4(e, 0.0, 0.0, 1.0);
+            gl_FragColor = vec4(e);
         }
     `);
 
@@ -1084,7 +1001,7 @@ class GpuBoundaryProgram {
     let gp = this.gp;
     let uf = gp.uniforms;
     gp.bind();
-    gl.uniform2f(uf.center, 0.5, 0.5);
+    gl.uniform2f(uf.center, 0, 0);
     gl.uniform1f(uf.radius, radius);
     gl.uniform1f(uf.sharpness, sharpness);
     gl.uniform1f(uf.thickness, thickness);
@@ -1105,7 +1022,7 @@ class GpuRescalingProgram {
         varying vec2 vUv;
 
         uniform sampler2D uData;
-        uniform float shift;
+        uniform vec4 shift;
         uniform float scale;
 
         void main () {
@@ -1119,11 +1036,11 @@ class GpuRescalingProgram {
       this.fragmentShader);
   }
 
-  run({ output, input, shift = 0.0, scale = 1.0 }) {
+  run({ output, input, shift = [0, 0], scale = 1.0 }) {
     let gl = this.gpuc.gl;
     let vars = this.gp.uniforms;
     this.gp.bind();
-    gl.uniform1f(vars.shift, shift);
+    gl.uniform4f(vars.shift, shift[0], shift[1], 0, 0);
     gl.uniform1f(vars.scale, scale);
     gl.uniform1i(vars.uData, input.attach(0));
     GpuProgram.blit(gl, output);
@@ -1170,6 +1087,9 @@ class GpuStatsProgram {
       }
     `);
 
+    // s.xy = avg(u)
+    // s.z = max(length(u))
+    // s.w = variance(length(u))
     this.fragmentShader = GpuProgram.createFragmentShader(gl, `
       precision highp float;
       precision highp sampler2D;
@@ -1186,22 +1106,22 @@ class GpuStatsProgram {
 
       // en.wikipedia.org/wiki/Algorithms_for_calculating_variance
       vec4 merge(vec4 u1, vec4 u2, float n) {
-        float d = u1.z - u2.z;
-        float avg = 0.5*(u1.z + u2.z);
-        float var = u1.w + u2.w + d*d*n*0.5;
+        vec2 d = u1.xy - u2.xy;
+        vec2 avg = 0.5*(u1.xy + u2.xy);
+        float var = u1.w + u2.w + dot(d, d)*n*0.5;
         
         return vec4(
-          min(u1.x, u2.x),
-          max(u1.y, u2.y),
           avg,
+          max(u1.z, u2.z),
           var);
       }
 
       void main () {
         if (count < 1.0) {
-          // min = max = avg = u.x, stddev = 0
-          vec4 u = texture2D(uData, v1);
-          gl_FragColor = vec4(u.xxx, 0.0);
+          // avg = u, max = r, var = 0
+          vec2 u = texture2D(uData, v1).xy;
+          float r = length(u);
+          gl_FragColor = vec4(u, r, 0.0);
           return;
         }
 
@@ -1259,5 +1179,83 @@ class GpuStatsProgram {
     let gl = this.gl;
     gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, res);
     return [...res];
+  }
+}
+
+class GpuSWaveProgram {
+  get output() {
+    return this.frames[0];
+  }
+
+  constructor(gpuContext, { boundary, size, dx, dt }) {
+    console.log('Explicit S wave solver:', size, 'dt', dt);
+    let gl = gpuContext.gl;
+
+    this.gl = gl;
+    this.size = size;
+    this.dx = dx;
+    this.boundary = boundary;
+
+    this.frames = [
+      gpuContext.createFrameBuffer(size, 2),
+      gpuContext.createFrameBuffer(size, 2)];
+
+    this.vertexShader = GpuLaplaceVertexShader.get(gl);
+
+    this.fragmentShader = GpuProgram.createFragmentShader(gl, `
+        precision highp float;
+        precision highp sampler2D;
+
+        varying vec2 vUv;
+
+        varying vec2 vL;
+        varying vec2 vR;
+        varying vec2 vT;
+        varying vec2 vB;
+
+        varying vec2 vLT;
+        varying vec2 vRT;
+        varying vec2 vLB;
+        varying vec2 vRB;        
+
+        uniform sampler2D uBoundary;
+        uniform sampler2D uPrev;
+        uniform vec2 gPrev;
+
+        ${GpuWaveProgram.utils}
+
+        void main () {
+            vec2 v = vUv * 2.0 - 1.0;
+            float p = 1.0 / (0.1 + dot(v, v));
+            float c = ${(dt / dx ** 2).toExponential()};
+            float b = texture2D(uBoundary, vUv).r;
+            vec2 u1 = texture2D(uPrev, vUv).xy;
+            vec2 diff = diffuse(uPrev);
+            vec2 du = 5e-4*c*diff - ${dt}*xmul(gPrev, u1)*p;
+            vec2 u0 = u1 + vec2(-du.y, du.x); // du*i, i*i = -1
+            
+            gl_FragColor = vec4(u0*(1.0 - b), 0.0, 0.0);
+        }
+    `);
+
+    this.gp = new GpuProgram(
+      this.gl,
+      this.vertexShader,
+      this.fragmentShader);
+  }
+
+  run(force) {
+    let [f0, f1] = this.frames;
+    this.frames = [f1, f0];
+
+    let gl = this.gl;
+    let gp = this.gp;
+    let uf = gp.uniforms;
+    gp.bind();
+    gl.uniform2f(uf.gPrev, force[0], 0*force[1]);
+    gl.uniform1f(uf.dx, this.dx);
+    gl.uniform1i(uf.uBoundary, this.boundary.attach(0));
+    gl.uniform1i(uf.uPrev, f0.attach(1));
+    GpuProgram.blit(gl, f1);
   }
 }
